@@ -41,7 +41,12 @@ export default defineManifest({
         service_worker: "src/background.ts",
         type: "module",
     },
-    permissions: ["storage", "tabs"],
+    // `scripting` lets the service worker register the bridge content script
+    // for self-hosted origins the user pairs at runtime (see background.ts).
+    // The statically-declared bridge below only covers the hosted origin;
+    // granting a host permission alone never starts a declared content script
+    // on a new origin, so paired instances need explicit registration.
+    permissions: ["storage", "tabs", "scripting"],
     host_permissions: [
         "https://api.plaud.ai/*",
         "https://api-euc1.plaud.ai/*",

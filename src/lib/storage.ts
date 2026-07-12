@@ -8,7 +8,7 @@
  * upgrade. Do not rename without a migration.
  */
 
-const KEY_ORIGINS = "openplaudOrigins";
+export const ORIGINS_STORAGE_KEY = "openplaudOrigins";
 
 export interface StoredOrigin {
     origin: string;
@@ -16,8 +16,8 @@ export interface StoredOrigin {
 }
 
 export async function getPairedOrigins(): Promise<StoredOrigin[]> {
-    const data = await chrome.storage.local.get(KEY_ORIGINS);
-    const list = data[KEY_ORIGINS];
+    const data = await chrome.storage.local.get(ORIGINS_STORAGE_KEY);
+    const list = data[ORIGINS_STORAGE_KEY];
     return Array.isArray(list) ? (list as StoredOrigin[]) : [];
 }
 
@@ -29,7 +29,7 @@ export async function addPairedOrigin(origin: string): Promise<StoredOrigin[]> {
         ...existing,
         { origin: normalized, addedAt: Date.now() },
     ];
-    await chrome.storage.local.set({ [KEY_ORIGINS]: next });
+    await chrome.storage.local.set({ [ORIGINS_STORAGE_KEY]: next });
     return next;
 }
 
@@ -38,6 +38,6 @@ export async function removePairedOrigin(
 ): Promise<StoredOrigin[]> {
     const existing = await getPairedOrigins();
     const next = existing.filter((o) => o.origin !== origin);
-    await chrome.storage.local.set({ [KEY_ORIGINS]: next });
+    await chrome.storage.local.set({ [ORIGINS_STORAGE_KEY]: next });
     return next;
 }
