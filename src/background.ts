@@ -59,11 +59,15 @@ function isStale(state: BridgeState): boolean {
 const DYNAMIC_BRIDGE_PREFIX = "riffado-bridge:";
 
 // The statically-declared bridge content script (the one covering the hosted
-// origin). We reuse both its built js path and its match list.
+// origin). We reuse both its built js path and its match list. It's identified
+// by its source module name — the bundler emits a hashed filename that still
+// contains "content-bridge", an unambiguous fingerprint. Matching on the
+// riffado.com origin instead would be fragile: a future unrelated script could
+// share that origin (or a `notriffado.com` match would substring-match it).
 function bridgeContentScript() {
     const manifest = chrome.runtime.getManifest();
     return (manifest.content_scripts ?? []).find((cs) =>
-        (cs.matches ?? []).some((m) => m.includes("riffado.com")),
+        (cs.js ?? []).some((f) => f.includes("content-bridge")),
     );
 }
 
@@ -156,7 +160,20 @@ async function syncPairedContentScripts(): Promise<void> {
     try {
         do {
             reconcileQueued = false;
-            await reconcilePairedContentScripts();
+            // Catch per pass: if one reconcile rejects (e.g. a storage read
+            // throws), we must still drain any work that was coalesced during
+            // it. Letting the rejection escape the loop would reset
+            // reconcileRunning in `finally` while leaving reconcileQueued set,
+            // silently dropping that trailing pass until an unrelated event
+            // happened to trigger another sync.
+            try {
+                await reconcilePairedContentScripts();
+            } catch (err) {
+                console.warn(
+                    "[riffado-connector] bridge reconciliation pass failed:",
+                    err,
+                );
+            }
         } while (reconcileQueued);
     } finally {
         reconcileRunning = false;
