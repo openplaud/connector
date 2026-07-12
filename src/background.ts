@@ -58,21 +58,36 @@ function isStale(state: BridgeState): boolean {
 
 const DYNAMIC_BRIDGE_PREFIX = "riffado-bridge:";
 
-function bridgeScriptFiles(): string[] {
+// The statically-declared bridge content script (the one covering the hosted
+// origin). We reuse both its built js path and its match list.
+function bridgeContentScript() {
     const manifest = chrome.runtime.getManifest();
-    const bridge = (manifest.content_scripts ?? []).find((cs) =>
+    return (manifest.content_scripts ?? []).find((cs) =>
         (cs.matches ?? []).some((m) => m.includes("riffado.com")),
     );
-    return bridge?.js ?? [];
 }
 
-async function syncPairedContentScripts(): Promise<void> {
+function bridgeScriptFiles(): string[] {
+    return bridgeContentScript()?.js ?? [];
+}
+
+// Origins already covered by the static bridge declaration. Registering these
+// dynamically would double-inject the bridge (duplicate connect requests), so
+// they're excluded from the dynamic set.
+function staticallyCoveredOrigins(): Set<string> {
+    const matches = bridgeContentScript()?.matches ?? [];
+    return new Set(matches.map((m) => m.replace(/\/\*$/, "")));
+}
+
+async function reconcilePairedContentScripts(): Promise<void> {
     const js = bridgeScriptFiles();
     if (js.length === 0) return; // no bridge script in the manifest to mirror
 
+    const covered = staticallyCoveredOrigins();
     const paired = await getPairedOrigins();
     const wanted = new Map<string, string>(); // registration id -> match glob
     for (const { origin } of paired) {
+        if (covered.has(origin)) continue; // already injected statically
         wanted.set(`${DYNAMIC_BRIDGE_PREFIX}${origin}`, `${origin}/*`);
     }
 
@@ -120,6 +135,31 @@ async function syncPairedContentScripts(): Promise<void> {
                 err,
             );
         }
+    }
+}
+
+// Serialize + coalesce reconciliations. onStartup, onInstalled and the
+// storage.onChanged listener can all fire near-simultaneously; without this,
+// two overlapping runs would compute the same "new" origins and race on
+// registerContentScripts (duplicate id → thrown, then swallowed as a
+// misleading "failed to register" warning). Runs are serialized; requests
+// arriving mid-run collapse into a single trailing run.
+let reconcileRunning = false;
+let reconcileQueued = false;
+
+async function syncPairedContentScripts(): Promise<void> {
+    if (reconcileRunning) {
+        reconcileQueued = true;
+        return;
+    }
+    reconcileRunning = true;
+    try {
+        do {
+            reconcileQueued = false;
+            await reconcilePairedContentScripts();
+        } while (reconcileQueued);
+    } finally {
+        reconcileRunning = false;
     }
 }
 
