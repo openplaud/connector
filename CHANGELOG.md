@@ -7,6 +7,18 @@ and this project adheres to [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The plaud.ai tab no longer closes mid-login.** `content-plaud.ts` treated
+  the mere presence of any JWT-shaped value under a `pld_*` localStorage key
+  as "login complete" and forwarded it immediately; `background.ts` then
+  closed the plaud.ai tab the instant it received that message. A
+  leftover/expired token already sitting in storage (or a transient value
+  Plaud writes mid-handshake during an SSO redirect) looked identical to a
+  real one, so the tab could close before the user ever finished signing in
+  — and the dead token then failed to connect on the Riffado side. The
+  background worker now verifies a captured token against Plaud
+  (`/team-app/workspaces/list`, the same check the Riffado server runs)
+  before delivering it to the bridge and closing the tab; an unverified
+  capture is ignored and the content script keeps polling. (riffado/riffado#231)
 - **Self-hosted instances over plain HTTP can now be paired.** Adding an
   `http://` origin (e.g. a LAN/localhost Riffado at `http://192.168.1.107:3000`)
   silently failed because `optional_host_permissions` only declared
