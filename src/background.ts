@@ -79,13 +79,44 @@ async function startBridge(bridgeTabId: number): Promise<void> {
  *
  * `/team-app/workspaces/list` is the same endpoint the Riffado server uses
  * to validate a freshly connected token, so "verified here" and "verified
- * server-side" agree. `apiBase` is already restricted to `*.plaud.ai` hosts
- * via `host_permissions`, so this fetch needs no additional permission.
+ * server-side" agree. `apiBase` is constrained by `content-plaud.ts` to the
+ * hosts covered by `host_permissions` (see `isPermittedApiHost` below),
+ * which this function double-checks before fetching -- a request to any
+ * other host would be blocked by the browser anyway, but failing fast here
+ * gives a clear console message instead of a generic network-error catch.
  */
+const VERIFY_TIMEOUT_MS = 8_000;
+
+function isPermittedApiHost(apiBase: string): boolean {
+    try {
+        const origin = new URL(apiBase).origin;
+        const granted: string[] =
+            chrome.runtime.getManifest().host_permissions ?? [];
+        return granted.some((pattern: string) => {
+            try {
+                return new URL(pattern).origin === origin;
+            } catch {
+                return false;
+            }
+        });
+    } catch {
+        return false;
+    }
+}
+
 async function verifyPlaudToken(
     accessToken: string,
     apiBase: string,
 ): Promise<boolean> {
+    if (!isPermittedApiHost(apiBase)) {
+        console.warn(
+            `[riffado-connector] apiBase '${apiBase}' isn't covered by host_permissions; refusing to verify`,
+        );
+        return false;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
     try {
         const res = await fetch(
             `${apiBase}/team-app/workspaces/list?need_personal_workspace=true`,
@@ -95,6 +126,7 @@ async function verifyPlaudToken(
                     Authorization: `Bearer ${accessToken}`,
                     "Content-Type": "application/json",
                 },
+                signal: controller.signal,
             },
         );
         if (!res.ok) return false;
@@ -104,11 +136,14 @@ async function verifyPlaudToken(
         } | null;
         return body?.status === 0 && Array.isArray(body.data?.workspaces);
     } catch {
-        // Network error, Plaud unreachable, or a malformed body -- treat as
-        // "not verified yet" rather than surfacing an error. The caller
-        // keeps polling and will retry against a later (hopefully settled)
-        // capture instead of failing the whole connect attempt on a blip.
+        // Network error, timeout, Plaud unreachable, or a malformed body --
+        // treat as "not verified yet" rather than surfacing an error. The
+        // caller keeps polling and will retry against a later (hopefully
+        // settled) capture instead of failing the whole connect attempt on
+        // a blip.
         return false;
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
@@ -126,10 +161,23 @@ async function deliverTokenToBridge(
         return false;
     }
 
+    // Snapshot the session *before* the async verification gap. `pending`
+    // is a module-level variable a concurrent `startBridge`/`bridge:cancel`
+    // can replace or null out while we're awaiting the network round-trip
+    // below -- without this snapshot we'd deliver a stale capture to
+    // whatever bridge tab happens to be pending afterward, and close its
+    // (unrelated) plaud.ai tab out from under it.
+    const session = pending;
+
     const verified = await verifyPlaudToken(payload.accessToken, payload.apiBase);
     if (!verified) return false;
 
-    const { bridgeTabId, plaudTabId } = pending;
+    // The session was replaced or cancelled while we were verifying. This
+    // capture no longer belongs to the active attempt; drop it silently
+    // rather than acting on state that isn't ours.
+    if (pending !== session) return false;
+
+    const { bridgeTabId, plaudTabId } = session;
 
     try {
         await chrome.tabs.sendMessage(bridgeTabId, {

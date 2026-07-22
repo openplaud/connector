@@ -151,13 +151,24 @@ function hostToRegion(host: string): PlaudRegion {
     return "unknown";
 }
 
+// The only hosts covered by `host_permissions` in the manifest. Keep this
+// in sync with manifest.ts. A `domain` written to Plaud's own
+// `workspaceList` storage that resolves outside this set can't be fetched
+// by the background worker's verification step (no host permission) or by
+// PlaudClient on the Riffado server (SSRF guard there restricts to
+// `*.plaud.ai`, which is broader) -- accepting it here would silently
+// break the connect flow instead of failing with a clear message.
+const PERMITTED_API_HOSTS = new Set([
+    "api.plaud.ai",
+    "api-euc1.plaud.ai",
+    "api-apse1.plaud.ai",
+]);
+
 function normalizeApiBase(domain: string): string | null {
     try {
         const u = new URL(domain);
         if (u.protocol !== "https:") return null;
-        if (!u.hostname.endsWith(".plaud.ai") && u.hostname !== "plaud.ai") {
-            return null;
-        }
+        if (!PERMITTED_API_HOSTS.has(u.hostname)) return null;
         return `${u.protocol}//${u.hostname}`;
     } catch {
         return null;
