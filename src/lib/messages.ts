@@ -74,6 +74,15 @@ export type RuntimeMessage =
 export interface RuntimeResponse {
     ok: boolean;
     error?: string;
+    /**
+     * Only meaningful on the `plaud:token-captured` response. `true` means
+     * the background worker confirmed the captured token actually
+     * authenticates against Plaud before delivering it to the bridge tab
+     * and closing the plaud.ai tab. `false`/`undefined` means the sender
+     * should keep polling instead of assuming the connect finished
+     * (see content-plaud.ts).
+     */
+    verified?: boolean;
 }
 
 export const BRIDGE_VERSION = 1;

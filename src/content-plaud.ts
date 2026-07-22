@@ -40,10 +40,15 @@ import {
     type ConnectorTokenPayload,
     type PlaudRegion,
     type RuntimeMessage,
+    type RuntimeResponse,
 } from "./lib/messages";
 
 const POLL_INTERVAL_MS = 750;
 const POLL_TIMEOUT_MS = 90_000;
+// If the same candidate token fails verification, don't hammer
+// chrome.runtime/Plaud on every 750ms tick -- wait this long before
+// re-attempting the unchanged value.
+const RETRY_UNCHANGED_MS = 3_000;
 
 const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
@@ -219,9 +224,19 @@ function resolveApiBase(token: string): {
     return { apiBase: "https://api.plaud.ai", region: "global" };
 }
 
-async function tryForward(): Promise<boolean> {
-    const token = readPlaudToken();
-    if (!token) return false;
+/**
+ * Send a captured token candidate to the background worker and report
+ * whether it was verified + delivered.
+ *
+ * `readPlaudToken()` returns the first JWT-shaped value it finds in
+ * storage with no proof a login actually completed -- a leftover token
+ * from an earlier/expired session (or a transient value Plaud writes
+ * mid-handshake during an SSO redirect) is indistinguishable from a real
+ * one at this layer. The background worker verifies the token against
+ * Plaud before treating the connect as finished, so a `false` return here
+ * means "keep polling", not "something went wrong".
+ */
+async function tryForward(token: string): Promise<boolean> {
     const { apiBase, region } = resolveApiBase(token);
     const payload: ConnectorTokenPayload = {
         accessToken: token,
@@ -230,11 +245,11 @@ async function tryForward(): Promise<boolean> {
         capturedAt: Date.now(),
     };
     try {
-        await chrome.runtime.sendMessage({
+        const response = (await chrome.runtime.sendMessage({
             type: "plaud:token-captured",
             payload,
-        } satisfies RuntimeMessage);
-        return true;
+        } satisfies RuntimeMessage)) as RuntimeResponse | undefined;
+        return response?.verified === true;
     } catch {
         // Background not reachable (extension being reloaded, etc.).
         return false;
@@ -243,12 +258,23 @@ async function tryForward(): Promise<boolean> {
 
 async function pollUntilForwarded(): Promise<void> {
     const deadline = Date.now() + POLL_TIMEOUT_MS;
+    let lastAttempted: string | null = null;
+    let lastAttemptAt = 0;
     while (Date.now() < deadline) {
-        if (await tryForward()) return;
+        const token = readPlaudToken();
+        if (token) {
+            const changed = token !== lastAttempted;
+            const dueForRetry = Date.now() - lastAttemptAt > RETRY_UNCHANGED_MS;
+            if (changed || dueForRetry) {
+                lastAttempted = token;
+                lastAttemptAt = Date.now();
+                if (await tryForward(token)) return;
+            }
+        }
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
     console.debug(
-        "[riffado-connector] timed out waiting for pld_tokenstr in localStorage",
+        "[riffado-connector] timed out waiting for a verified Plaud session",
     );
 }
 

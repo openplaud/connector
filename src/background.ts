@@ -63,14 +63,71 @@ async function startBridge(bridgeTabId: number): Promise<void> {
     };
 }
 
+/**
+ * Confirm a captured token actually authenticates against Plaud before we
+ * hand it to the bridge and close the plaud.ai tab.
+ *
+ * content-plaud.ts captures the first JWT-shaped value it finds under a
+ * `pld_*` localStorage key, with no proof that a login actually completed --
+ * a leftover token from a prior/expired session (or a transient value Plaud
+ * writes mid-handshake during an SSO redirect) looks identical to a real
+ * one at that layer. Without this check, the background worker used to
+ * close the plaud.ai tab the instant *any* such value appeared, which could
+ * happen before the user ever saw the login form. The eventual connect on
+ * the Riffado side would then fail against a dead token, surfacing as a
+ * confusing server-side error there (see riffado/riffado#231).
+ *
+ * `/team-app/workspaces/list` is the same endpoint the Riffado server uses
+ * to validate a freshly connected token, so "verified here" and "verified
+ * server-side" agree. `apiBase` is already restricted to `*.plaud.ai` hosts
+ * via `host_permissions`, so this fetch needs no additional permission.
+ */
+async function verifyPlaudToken(
+    accessToken: string,
+    apiBase: string,
+): Promise<boolean> {
+    try {
+        const res = await fetch(
+            `${apiBase}/team-app/workspaces/list?need_personal_workspace=true`,
+            {
+                method: "GET",
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    "Content-Type": "application/json",
+                },
+            },
+        );
+        if (!res.ok) return false;
+        const body = (await res.json().catch(() => null)) as {
+            status?: number;
+            data?: { workspaces?: unknown[] };
+        } | null;
+        return body?.status === 0 && Array.isArray(body.data?.workspaces);
+    } catch {
+        // Network error, Plaud unreachable, or a malformed body -- treat as
+        // "not verified yet" rather than surfacing an error. The caller
+        // keeps polling and will retry against a later (hopefully settled)
+        // capture instead of failing the whole connect attempt on a blip.
+        return false;
+    }
+}
+
+/**
+ * Returns whether the token was verified and delivered. `false` means the
+ * caller should keep the plaud.ai tab open and keep polling -- the token
+ * captured so far doesn't authenticate yet.
+ */
 async function deliverTokenToBridge(
     payload: ConnectorTokenPayload,
-): Promise<void> {
-    if (!pending) return;
+): Promise<boolean> {
+    if (!pending) return false;
     if (isStale(pending)) {
         clearPending();
-        return;
+        return false;
     }
+
+    const verified = await verifyPlaudToken(payload.accessToken, payload.apiBase);
+    if (!verified) return false;
 
     const { bridgeTabId, plaudTabId } = pending;
 
@@ -95,6 +152,7 @@ async function deliverTokenToBridge(
     }
 
     clearPending();
+    return true;
 }
 
 chrome.runtime.onMessage.addListener(
@@ -125,10 +183,11 @@ chrome.runtime.onMessage.addListener(
 
         if (msg.type === "plaud:token-captured") {
             deliverTokenToBridge(msg.payload).then(
-                () => sendResponse({ ok: true }),
+                (verified) => sendResponse({ ok: true, verified }),
                 (err: unknown) =>
                     sendResponse({
                         ok: false,
+                        verified: false,
                         error: err instanceof Error ? err.message : String(err),
                     }),
             );
