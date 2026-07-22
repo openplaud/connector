@@ -6,7 +6,19 @@ and this project adheres to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-07-22
+
 ### Fixed
+- **Self-hosted instances now show as connected.** The bridge content
+  script that exposes `window.__riffadoConnector` was declared statically
+  for `riffado.com` only; pairing a self-hosted origin via the popup
+  granted host permission but never started the script there (MV3 doesn't
+  run a statically-declared content script on a newly permitted origin).
+  The app showed "Install Riffado Connector" indefinitely even though
+  pairing appeared to succeed. The background worker now registers the
+  bridge dynamically for every paired origin via `chrome.scripting`,
+  reconciled on startup/install and whenever the paired-origins list
+  changes. (#2)
 - **The plaud.ai tab no longer closes mid-login.** `content-plaud.ts` treated
   the mere presence of any JWT-shaped value under a `pld_*` localStorage key
   as "login complete" and forwarded it immediately; `background.ts` then
