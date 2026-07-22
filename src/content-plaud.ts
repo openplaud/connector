@@ -50,7 +50,15 @@ const POLL_TIMEOUT_MS = 90_000;
 // re-attempting the unchanged value.
 const RETRY_UNCHANGED_MS = 3_000;
 
-const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const JWT_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+// A real Plaud JWT header (minimum: `{"alg":"HS256","typ":"UT"}`) base64url-
+// encodes to well over a dozen characters, and the payload/signature
+// segments are longer still. These floors are deliberately generous --
+// they only need to reject pathologically short values, not tightly bound
+// real tokens.
+const MIN_HEADER_LEN = 10;
+const MIN_PAYLOAD_LEN = 16;
+const MIN_SIGNATURE_LEN = 16;
 
 console.debug("[riffado-connector] active on web.plaud.ai");
 
@@ -71,10 +79,50 @@ function stripBearer(s: string): string {
     return s.trim().replace(/^bearer\s+/i, "");
 }
 
+function base64UrlDecode(segment: string): string | null {
+    try {
+        const b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+        return atob(padded);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * `JWT_SHAPE_RE` alone ("three dot-separated base64url-charset segments")
+ * matches far more than real JWTs -- e.g. a stray app-version string like
+ * "1.3.6" under some unrelated `pld_*` key satisfies it trivially. That
+ * false positive got captured and forwarded as if it were a real access
+ * token, producing a `400` from Plaud's API (a syntactically bogus bearer
+ * value, not an auth/region problem). Require realistic segment lengths
+ * *and* a decodable JWT header (`{"alg":...}`) before treating a value as
+ * a genuine token candidate.
+ */
+function looksLikeJwt(candidate: string): boolean {
+    if (!JWT_SHAPE_RE.test(candidate)) return false;
+    const [header, payload, signature] = candidate.split(".");
+    if (
+        header.length < MIN_HEADER_LEN ||
+        payload.length < MIN_PAYLOAD_LEN ||
+        signature.length < MIN_SIGNATURE_LEN
+    ) {
+        return false;
+    }
+    const decodedHeader = base64UrlDecode(header);
+    if (!decodedHeader) return false;
+    try {
+        const parsed = JSON.parse(decodedHeader) as { alg?: unknown };
+        return typeof parsed.alg === "string";
+    } catch {
+        return false;
+    }
+}
+
 function extractJwtCandidate(raw: string | null | undefined): string | null {
     if (!raw) return null;
     const candidate = stripBearer(unwrapJsonString(raw));
-    return JWT_RE.test(candidate) ? candidate : null;
+    return looksLikeJwt(candidate) ? candidate : null;
 }
 
 function readPlaudToken(): string | null {

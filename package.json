@@ -1,6 +1,6 @@
 {
     "name": "riffado-connector",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "description": "Browser extension that bridges your Plaud session to Riffado (self-hosted or hosted).",
     "private": true,
     "license": "AGPL-3.0",

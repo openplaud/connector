@@ -6,6 +6,26 @@ and this project adheres to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-22
+
+### Fixed
+- **Login could silently fail after v0.2.1's verify-before-close change,
+  because a stray value could be captured as if it were the access token.**
+  `content-plaud.ts`'s JWT-candidate check only required "three
+  dot-separated base64url-charset segments" — a coincidental non-token
+  value under some other `pld_*` localStorage key (e.g. an app-version
+  string like `1.3.6`) satisfied that shape check trivially and could be
+  picked up before the real token was written, sent to Plaud as
+  `Authorization: Bearer 1.3.6`, and correctly rejected with `400 bad
+  request` — which (correctly, per v0.2.1's fix) kept the tab open and
+  polling, but never recovered if a real token capture kept losing to the
+  bogus one. `looksLikeJwt()` now requires realistic segment lengths and a
+  decodable JWT header (`{"alg":...}`) before treating a value as a token
+  candidate. Confirmed via curl that a real token round-trips fine against
+  `/team-app/workspaces/list` regardless of request Origin, so v0.2.1's
+  verify-before-close approach itself is correct — this was purely a
+  token-capture false positive.
+
 ## [0.2.1] — 2026-07-22
 
 ### Fixed
