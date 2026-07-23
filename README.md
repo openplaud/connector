@@ -58,10 +58,11 @@ welcome tab the first time, same as the Web Store install.
 3. You sign in there however you normally do — Google, Apple, or
    email/password. The extension does not see your password and does not
    interact with Google or Apple.
-4. Once Plaud's web app has obtained an access token (visible to the page
-   in `localStorage` and on every `Authorization: Bearer …` header it
-   sends), the extension reads it, closes the Plaud tab, and hands the
-   token to the Riffado tab.
+4. Once Plaud has issued you a session, the extension reads your access
+   token from Plaud's own `pld_ut` cookie (via `chrome.cookies`, the only
+   API that can read it — it's `HttpOnly`, so no page script ever could),
+   confirms it actually authenticates against Plaud, closes the Plaud tab,
+   and hands the token to the Riffado tab.
 5. The Riffado page POSTs the token to its own
    `/api/plaud/auth/connect-token` endpoint with your existing Riffado
    session cookie. Done.
@@ -79,11 +80,13 @@ browser. Privacy policy:
 | --- | --- |
 | `storage` | Remember which self-hosted Riffado origins you've paired. |
 | `tabs` | Open `web.plaud.ai` in a new tab and close it after capture; open the welcome tab on first install. |
-| `host_permissions: web.plaud.ai, api*.plaud.ai` | Read your token from a logged-in Plaud session. |
+| `scripting` | Register the bridge on self-hosted origins paired at runtime (the hosted origin's bridge is declared statically instead). |
+| `cookies` | Read Plaud's `pld_ut` session cookie, which carries your access token. That cookie is `HttpOnly` — no page JavaScript, including a content script, can read it via `document.cookie`; `chrome.cookies` is the only API that can. Scoped by the `host_permissions` below, not `<all_urls>`. |
+| `host_permissions: web.plaud.ai, api*.plaud.ai` | Open the login tab, read the token cookie, and verify it against Plaud before treating a connect as done. |
 | `host_permissions: riffado.com` | Inject the bridge into the hosted Riffado app. |
 | `optional_host_permissions: https://*/*, http://*/*` | Self-hosted instances can be paired at runtime via the popup (HTTP is allowed for LAN/localhost deployments). Each one prompts you separately. |
 
-Not used: `cookies`, `webRequest`, `<all_urls>` content scripts, anything
+Not used: `webRequest`, `<all_urls>` content scripts, anything
 Google/Apple-related.
 
 ---
@@ -111,20 +114,20 @@ corresponding host permission at the same time.
 │  (your Riffado origin) │                      │  (service worker)         │
 │                          │                      │                           │
 │  injects ↓               │                      │  - opens web.plaud.ai     │
-│                          │                      │  - one bridge in flight   │
-│  page-bridge.ts          │                      │  - forwards token back    │
-│  (page main world)       │                      └─────────────┬─────────────┘
-│                          │                                    │
-│  exposes:                │                                    │ chrome.tabs
-│  window.__riffado        │                                    ▼
-│      Connector.connect() │                      ┌───────────────────────────┐
-│                          │ ◀─── tab message ─── │  content-plaud.ts         │
-└──────────────────────────┘                      │  (web.plaud.ai)           │
-            │                                     │                           │
-            │ Promise<{ accessToken, apiBase }>   │  - localStorage poll      │
-            │                                     │  - fetch() Auth sniff     │
-            ▼                                     │  - sends to background    │
-┌──────────────────────────┐                      └───────────────────────────┘
+│                          │                      │  - polls chrome.cookies   │
+│  page-bridge.ts          │                      │    for the pld_ut cookie  │
+│  (page main world)       │                      │  - verifies the token     │
+│                          │                      │    against Plaud          │
+│  exposes:                │                      │  - forwards it back +     │
+│  window.__riffado        │                      │    closes the plaud tab   │
+│      Connector.connect() │                      └─────────────┬─────────────┘
+│                          │ ◀─── tab message ─── ┘
+└──────────────────────────┘
+            │                     chrome.cookies.get() reads Plaud's HttpOnly
+            │ Promise<{ accessToken, apiBase }>   pld_ut cookie directly --
+            │                     no content script runs on web.plaud.ai at all.
+            ▼
+┌──────────────────────────┐
 │  Riffado page          │
 │  POST /api/plaud/auth/   │
 │       connect-token      │
@@ -134,6 +137,12 @@ corresponding host permission at the same time.
 
 The connector is a courier, not a server. It carries one short-lived
 secret across two tabs the same browser already trusts.
+
+An earlier version scanned `localStorage` on `web.plaud.ai` for a
+token-shaped value via an injected content script. That approach could
+never reliably find the real token: Plaud authenticates the web app with
+an `HttpOnly` cookie, which by definition no page JavaScript can read.
+`chrome.cookies` is the correct, intended API for this.
 
 ---
 
@@ -150,14 +159,18 @@ Threats considered:
   origin you've paired could call `connect()` and try to capture the
   token, but you've already granted that origin the right to receive
   tokens by pairing it. Don't pair origins you don't control.
-- **Plaud changing their token storage shape.** The connector polls
-  `localStorage["access_token"]` *and* sniffs `Authorization` headers on
-  outgoing `api*.plaud.ai` requests. If Plaud changes one path, the other
-  still works. If they change both, we ship a connector update.
+- **A captured value that isn't actually a working token.** Before
+  treating a connect as done, the service worker verifies the captured
+  token against Plaud's own API (`/team-app/workspaces/list`) -- the same
+  check Riffado's server runs when it stores the connection. A stale or
+  malformed value never reaches your Riffado instance.
+- **Plaud changing their token storage shape.** The connector currently
+  reads the `pld_ut` cookie via `chrome.cookies`. If Plaud renames or
+  restructures it, we ship a connector update.
 - **Token in flight.** Stays inside one browser; never crosses our
-  infrastructure. From `web.plaud.ai` → service worker → your Riffado
-  tab → your Riffado server, all over local IPC except the final POST
-  which is HTTPS to a host you chose.
+  infrastructure. From `web.plaud.ai`'s cookie jar → service worker →
+  your Riffado tab → your Riffado server, all over local IPC except the
+  final POST which is HTTPS to a host you chose.
 
 ---
 

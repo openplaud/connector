@@ -4,14 +4,14 @@
  * file the single source of truth so refactors don't drift.
  *
  *   page-bridge (page world)
- *      \u2192 window.postMessage  \u2192  content-bridge (isolated world)
- *      \u2192 chrome.runtime      \u2192  background
- *      \u2192 chrome.tabs         \u2192  content-plaud (web.plaud.ai)
+ *      → window.postMessage  →  content-bridge (isolated world)
+ *      → chrome.runtime      →  background
  *
- *   content-plaud (token captured)
- *      \u2192 chrome.runtime      \u2192  background
- *      \u2192 chrome.tabs         \u2192  content-bridge
- *      \u2192 window.postMessage  \u2192  page-bridge \u2192 caller's Promise resolves
+ *   background (polls chrome.cookies for Plaud's pld_ut cookie directly --
+ *   no content script runs on web.plaud.ai; that cookie is HttpOnly and no
+ *   page JavaScript can ever read it)
+ *      → chrome.tabs         →  content-bridge
+ *      → window.postMessage  →  page-bridge → caller's Promise resolves
  */
 
 export type PlaudRegion = "global" | "euc1" | "apse1" | "unknown";
@@ -23,7 +23,7 @@ export interface ConnectorTokenPayload {
     capturedAt: number;
 }
 
-// \u2500\u2500 Page \u2194 content (window.postMessage) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// ── Page ↔ content (window.postMessage) ─────────────────────────────────
 //
 // Every message carries `__riffado` so the listener can ignore unrelated
 // postMessage traffic on the page.
@@ -64,7 +64,7 @@ export type PageResponse =
           error: string;
       };
 
-// \u2500\u2500 Content \u2194 background (chrome.runtime.sendMessage) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// ── Content ↔ background (chrome.runtime.sendMessage) ───────────────────
 
 export type RuntimeMessage =
     | { type: "bridge:request-connect"; bridgeTabId?: number }
@@ -74,15 +74,6 @@ export type RuntimeMessage =
 export interface RuntimeResponse {
     ok: boolean;
     error?: string;
-    /**
-     * Only meaningful on the `plaud:token-captured` response. `true` means
-     * the background worker confirmed the captured token actually
-     * authenticates against Plaud before delivering it to the bridge tab
-     * and closing the plaud.ai tab. `false`/`undefined` means the sender
-     * should keep polling instead of assuming the connect finished
-     * (see content-plaud.ts).
-     */
-    verified?: boolean;
 }
 
 export const BRIDGE_VERSION = 1;

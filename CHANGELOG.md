@@ -6,6 +6,31 @@ and this project adheres to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-07-22
+
+### Changed
+- **Token capture no longer scans `localStorage` — it reads Plaud's session
+  cookie directly.** Debugging v0.2.2 against a real account revealed that
+  `localStorage["pld_tokenstr"]` (the documented storage location this
+  extension's capture logic was built around) doesn't exist for this login
+  method at all; Plaud authenticates `web.plaud.ai` with an `HttpOnly`
+  `pld_ut` cookie instead. `HttpOnly` means no page JavaScript -- including
+  a content script -- can ever read that cookie's value via
+  `document.cookie`; no amount of tuning the localStorage-scanning
+  heuristics could have found it. `content-plaud.ts` (the content script
+  that ran on `web.plaud.ai`) is removed entirely. The background service
+  worker now reads `pld_ut` directly via `chrome.cookies.get()` -- the
+  correct, privileged API for reading `HttpOnly` cookies -- polling it the
+  same way the old code polled localStorage, decoding the region from the
+  token's own `region` claim instead of a separate localStorage read, and
+  verifying it against Plaud exactly as v0.2.1/v0.2.2 already did before
+  delivering it and closing the tab. Requires a new `cookies` permission,
+  scoped to the existing `*.plaud.ai` host permissions.
+- Verified end-to-end against a mocked `chrome.*`/`fetch` harness exercising
+  the real background.ts source with both a garbage cookie value (correctly
+  never delivered) and a real captured token shape (correctly verified,
+  delivered, region resolved to the right regional host, tab closed).
+
 ## [0.2.2] — 2026-07-22
 
 ### Fixed

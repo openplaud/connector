@@ -62,8 +62,9 @@ forwarding the resulting access token to Riffado.
 2. Clicking it opens web.plaud.ai in a new tab.
 3. You sign in there however you normally do. The extension never sees
    your password and never interacts with Google or Apple.
-4. Once Plaud has issued you a token, the extension hands it to your
-   Riffado tab. The Plaud tab closes automatically.
+4. Once Plaud has issued you a token, the extension verifies it against
+   Plaud and hands it to your Riffado tab. The Plaud tab closes
+   automatically.
 5. Your Riffado tab POSTs the token to its own backend over HTTPS.
 
 **What it does not do.**
@@ -91,13 +92,29 @@ synced and never transmitted.
 
 ### `tabs`
 Used to open `web.plaud.ai` in a new tab so the user can sign in, and to
-close that tab automatically once the token has been captured. Also used
-to open the welcome page on first install.
+close that tab automatically once the token has been captured and
+verified. Also used to open the welcome page on first install.
+
+### `scripting`
+Registers the bridge content script for self-hosted Riffado origins the
+user pairs at runtime via the popup. The hosted origin's bridge is
+declared statically in the manifest instead; granting a host permission
+alone does not start a statically-declared content script on a new
+origin, so paired instances need explicit registration.
+
+### `cookies`
+Reads Plaud's `pld_ut` session cookie, which carries the user's access
+token, from a tab where the user is already signed in to Plaud. That
+cookie is `HttpOnly`, so no page JavaScript -- including a content
+script -- can read it via `document.cookie`; `chrome.cookies` is the only
+API that can read an `HttpOnly` cookie's value, and it's the intended use
+case for exactly this kind of session handoff. Scoped by the
+`https://*.plaud.ai/*` host permission below, not `<all_urls>`.
 
 ### Host permission: `https://*.plaud.ai/*`
-The extension reads the access token from `localStorage` and from
-outgoing `Authorization` headers on a tab where the user is already
-signed in to Plaud. This is the only way to obtain the token without
+The extension reads the access token from Plaud's `pld_ut` cookie via
+`chrome.cookies`, and verifies it against Plaud's own API before treating
+a connect as complete. This is the only way to obtain the token without
 asking the user for their password.
 
 ### Host permission: `https://riffado.com/*`

@@ -6,18 +6,23 @@
  *      `bridge:request-connect` when the user clicks "Continue with Plaud".
  *   2. We open https://web.plaud.ai in a new focused tab and remember which
  *      Riffado tab to send the result back to.
- *   3. content-plaud (running on web.plaud.ai) sends `plaud:token-captured`
- *      with the access token + detected region.
- *   4. We forward the token back to the originating Riffado tab and close
- *      (or leave) the plaud.ai tab.
+ *   3. We poll `chrome.cookies` directly for Plaud's `pld_ut` session
+ *      cookie -- no content script runs on web.plaud.ai for this anymore
+ *      (see the file-header comment on the token-capture section below for
+ *      why). Once a candidate value passes shape validation, we confirm it
+ *      actually authenticates against Plaud before treating the connect as
+ *      done.
+ *   4. On a verified token, we forward it to the originating Riffado tab
+ *      and close the plaud.ai tab.
  *
- * Only one bridge request can be in flight at a time \u2014 starting a second
+ * Only one bridge request can be in flight at a time — starting a second
  * cancels the first. Keeps the model simple; the user is never juggling
  * two connect attempts.
  */
 
 import type {
     ConnectorTokenPayload,
+    PlaudRegion,
     RuntimeMessage,
     RuntimeResponse,
 } from "./lib/messages";
@@ -189,8 +194,156 @@ chrome.storage.onChanged.addListener((changes, area) => {
     );
 });
 
+// ---------------------------------------------------------------------------
+// Token capture via chrome.cookies.
+//
+// Plaud's web app authenticates web.plaud.ai with a `pld_ut` cookie carrying
+// the long-lived user token (UT) -- and that cookie is HttpOnly. No page
+// JavaScript, including a content script, can ever read an HttpOnly cookie's
+// value; that's the entire point of the flag. An earlier version of this
+// extension scanned localStorage for a token-shaped value instead, which was
+// fundamentally unable to find it -- Plaud doesn't store the token there
+// (at least not for every login method; see riffado/riffado#231 and its
+// follow-ups for the debugging trail).
+//
+// `chrome.cookies` is a privileged extension API specifically designed to
+// read cookies, including HttpOnly ones, for exactly this kind of legitimate
+// session handoff. It's scoped by the existing plaud.ai `host_permissions`,
+// not `<all_urls>`.
+// ---------------------------------------------------------------------------
+
+const PLAUD_UT_COOKIE_URL = "https://web.plaud.ai/";
+const PLAUD_UT_COOKIE_NAME = "pld_ut";
+const TOKEN_POLL_INTERVAL_MS = 750;
+const TOKEN_POLL_TIMEOUT_MS = 90_000;
+// If the same candidate token fails verification, don't hammer
+// chrome.cookies/Plaud on every 750ms tick -- wait this long before
+// re-attempting the unchanged value.
+const RETRY_UNCHANGED_MS = 3_000;
+
+const JWT_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+// A real Plaud JWT header (minimum: `{"alg":"HS256","typ":"UT"}`) base64url-
+// encodes to well over a dozen characters, and the payload/signature
+// segments are longer still. These floors only need to reject
+// pathologically short values, not tightly bound real tokens.
+const MIN_HEADER_LEN = 10;
+const MIN_PAYLOAD_LEN = 16;
+const MIN_SIGNATURE_LEN = 16;
+
+function base64UrlDecode(segment: string): string | null {
+    try {
+        const b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+        // atob is available in MV3 service workers.
+        return atob(padded);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * `JWT_SHAPE_RE` alone ("three dot-separated base64url-charset segments")
+ * matches far more than real JWTs -- a coincidental non-token cookie/value
+ * could satisfy it trivially. Require realistic segment lengths *and* a
+ * decodable JWT header (`{"alg":...}`) before treating a value as a genuine
+ * token candidate. Belt-and-suspenders on top of reading a specifically-
+ * named, Plaud-controlled cookie (which is a much higher-trust source than
+ * the old approach of scanning arbitrary localStorage keys ever was).
+ */
+function looksLikeJwt(candidate: string): boolean {
+    if (!JWT_SHAPE_RE.test(candidate)) return false;
+    const [header, payload, signature] = candidate.split(".");
+    if (
+        header.length < MIN_HEADER_LEN ||
+        payload.length < MIN_PAYLOAD_LEN ||
+        signature.length < MIN_SIGNATURE_LEN
+    ) {
+        return false;
+    }
+    const decodedHeader = base64UrlDecode(header);
+    if (!decodedHeader) return false;
+    try {
+        const parsed = JSON.parse(decodedHeader) as { alg?: unknown };
+        return typeof parsed.alg === "string";
+    } catch {
+        return false;
+    }
+}
+
+function decodeJwtRegion(token: string): string | null {
+    try {
+        const parts = token.split(".");
+        if (parts.length !== 3) return null;
+        const decoded = base64UrlDecode(parts[1]);
+        if (!decoded) return null;
+        const claims = JSON.parse(decoded) as { region?: unknown };
+        return typeof claims.region === "string" ? claims.region : null;
+    } catch {
+        return null;
+    }
+}
+
+function apiBaseFromAwsRegion(awsRegion: string): string | null {
+    switch (awsRegion) {
+        case "aws:us-west-2":
+            return "https://api.plaud.ai";
+        case "aws:eu-central-1":
+            return "https://api-euc1.plaud.ai";
+        case "aws:ap-southeast-1":
+            return "https://api-apse1.plaud.ai";
+        default:
+            return null;
+    }
+}
+
+function hostToRegion(host: string): PlaudRegion {
+    if (host === "api.plaud.ai") return "global";
+    if (host === "api-euc1.plaud.ai") return "euc1";
+    if (host === "api-apse1.plaud.ai") return "apse1";
+    return "unknown";
+}
+
+/**
+ * Region is derived from the token's own `region` claim -- every real token
+ * we've inspected carries it (`"region":"aws:eu-central-1"`, etc.), and
+ * decoding it here needs no content script or localStorage access. Defaults
+ * to global if the claim is missing or unrecognized.
+ */
+function resolveApiBaseFromToken(token: string): {
+    apiBase: string;
+    region: PlaudRegion;
+} {
+    const awsRegion = decodeJwtRegion(token);
+    if (awsRegion) {
+        const fromJwt = apiBaseFromAwsRegion(awsRegion);
+        if (fromJwt) {
+            return {
+                apiBase: fromJwt,
+                region: hostToRegion(new URL(fromJwt).hostname),
+            };
+        }
+        console.debug(
+            `[riffado-connector] unknown JWT region '${awsRegion}', defaulting to global`,
+        );
+    }
+    return { apiBase: "https://api.plaud.ai", region: "global" };
+}
+
+async function getPlaudUtCookie(): Promise<string | null> {
+    try {
+        const cookie = await chrome.cookies.get({
+            url: PLAUD_UT_COOKIE_URL,
+            name: PLAUD_UT_COOKIE_NAME,
+        });
+        return cookie?.value ?? null;
+    } catch (err) {
+        console.warn("[riffado-connector] chrome.cookies.get failed:", err);
+        return null;
+    }
+}
+
 async function startBridge(bridgeTabId: number): Promise<void> {
-    // Cancel any prior bridge request \u2014 we only support one at a time.
+    // Cancel any prior bridge request — we only support one at a time.
     if (pending) {
         try {
             if (pending.plaudTabId !== undefined) {
@@ -206,34 +359,61 @@ async function startBridge(bridgeTabId: number): Promise<void> {
         active: true,
     });
 
-    pending = {
+    const session: BridgeState = {
         bridgeTabId,
         plaudTabId: tab.id,
         startedAt: Date.now(),
     };
+    pending = session;
+
+    void pollForToken(session);
+}
+
+async function pollForToken(session: BridgeState): Promise<void> {
+    const deadline = session.startedAt + TOKEN_POLL_TIMEOUT_MS;
+    let lastAttempted: string | null = null;
+    let lastAttemptAt = 0;
+
+    while (Date.now() < deadline) {
+        // This attempt was superseded by a new startBridge() / cancelled.
+        if (pending !== session) return;
+
+        const token = await getPlaudUtCookie();
+        if (token && looksLikeJwt(token)) {
+            const changed = token !== lastAttempted;
+            const dueForRetry = Date.now() - lastAttemptAt > RETRY_UNCHANGED_MS;
+            if (changed || dueForRetry) {
+                lastAttempted = token;
+                lastAttemptAt = Date.now();
+                const { apiBase, region } = resolveApiBaseFromToken(token);
+                const payload: ConnectorTokenPayload = {
+                    accessToken: token,
+                    apiBase,
+                    region,
+                    capturedAt: Date.now(),
+                };
+                if (await deliverTokenToBridge(session, payload)) return;
+            }
+        }
+
+        await new Promise((r) => setTimeout(r, TOKEN_POLL_INTERVAL_MS));
+    }
+    console.debug(
+        "[riffado-connector] timed out waiting for a verified Plaud session",
+    );
 }
 
 /**
  * Confirm a captured token actually authenticates against Plaud before we
  * hand it to the bridge and close the plaud.ai tab.
  *
- * content-plaud.ts captures the first JWT-shaped value it finds under a
- * `pld_*` localStorage key, with no proof that a login actually completed --
- * a leftover token from a prior/expired session (or a transient value Plaud
- * writes mid-handshake during an SSO redirect) looks identical to a real
- * one at that layer. Without this check, the background worker used to
- * close the plaud.ai tab the instant *any* such value appeared, which could
- * happen before the user ever saw the login form. The eventual connect on
- * the Riffado side would then fail against a dead token, surfacing as a
- * confusing server-side error there (see riffado/riffado#231).
- *
  * `/team-app/workspaces/list` is the same endpoint the Riffado server uses
  * to validate a freshly connected token, so "verified here" and "verified
- * server-side" agree. `apiBase` is constrained by `content-plaud.ts` to the
- * hosts covered by `host_permissions` (see `isPermittedApiHost` below),
- * which this function double-checks before fetching -- a request to any
- * other host would be blocked by the browser anyway, but failing fast here
- * gives a clear console message instead of a generic network-error catch.
+ * server-side" agree (confirmed by directly comparing responses: a real
+ * token succeeds against this endpoint regardless of request Origin, so
+ * there's no CORS/origin obstacle to calling it from the service worker).
+ * `apiBase` is constrained to the hosts covered by `host_permissions` (see
+ * `isPermittedApiHost`), which this function double-checks before fetching.
  */
 const VERIFY_TIMEOUT_MS = 8_000;
 
@@ -303,21 +483,14 @@ async function verifyPlaudToken(
  * captured so far doesn't authenticate yet.
  */
 async function deliverTokenToBridge(
+    session: BridgeState,
     payload: ConnectorTokenPayload,
 ): Promise<boolean> {
-    if (!pending) return false;
-    if (isStale(pending)) {
-        clearPending();
+    if (pending !== session) return false;
+    if (isStale(session)) {
+        if (pending === session) clearPending();
         return false;
     }
-
-    // Snapshot the session *before* the async verification gap. `pending`
-    // is a module-level variable a concurrent `startBridge`/`bridge:cancel`
-    // can replace or null out while we're awaiting the network round-trip
-    // below -- without this snapshot we'd deliver a stale capture to
-    // whatever bridge tab happens to be pending afterward, and close its
-    // (unrelated) plaud.ai tab out from under it.
-    const session = pending;
 
     const verified = await verifyPlaudToken(payload.accessToken, payload.apiBase);
     if (!verified) return false;
@@ -377,19 +550,6 @@ chrome.runtime.onMessage.addListener(
                     }),
             );
             return true; // async response
-        }
-
-        if (msg.type === "plaud:token-captured") {
-            deliverTokenToBridge(msg.payload).then(
-                (verified) => sendResponse({ ok: true, verified }),
-                (err: unknown) =>
-                    sendResponse({
-                        ok: false,
-                        verified: false,
-                        error: err instanceof Error ? err.message : String(err),
-                    }),
-            );
-            return true;
         }
 
         if (msg.type === "bridge:cancel") {

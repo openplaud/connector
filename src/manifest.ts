@@ -16,10 +16,22 @@ import pkg from "../package.json";
  *
  *   - `permissions`:
  *       - storage  — remember the user's self-hosted origins between sessions.
- *       - tabs     — open web.plaud.ai in a new tab and watch for it to load
- *                    (see `tabs.onUpdated` listener in background.ts).
+ *       - tabs     — open web.plaud.ai in a new tab and close it once the
+ *                    token has been captured and verified.
+ *       - scripting — register the bridge content script for self-hosted
+ *                    origins paired at runtime (see background.ts). The
+ *                    statically-declared bridge below only covers the
+ *                    hosted origin.
+ *       - cookies  — read Plaud's `pld_ut` session cookie, which carries
+ *                    the long-lived user token. That cookie is HttpOnly,
+ *                    so no page JavaScript (including a content script)
+ *                    can ever read it via `document.cookie`; `chrome.cookies`
+ *                    is the only way to obtain its value, and it's the
+ *                    intended API for exactly this kind of session
+ *                    handoff. Scoped by the plaud.ai `host_permissions`
+ *                    above, not `<all_urls>`.
  *
- *   - No `cookies`, no `webRequest`, no `<all_urls>`.
+ *   - No `webRequest`, no `<all_urls>`.
  */
 export default defineManifest({
     manifest_version: 3,
@@ -46,7 +58,9 @@ export default defineManifest({
     // The statically-declared bridge below only covers the hosted origin;
     // granting a host permission alone never starts a declared content script
     // on a new origin, so paired instances need explicit registration.
-    permissions: ["storage", "tabs", "scripting"],
+    // `cookies` lets the service worker read Plaud's HttpOnly `pld_ut`
+    // session cookie directly -- see the file-header comment above.
+    permissions: ["storage", "tabs", "scripting", "cookies"],
     host_permissions: [
         "https://api.plaud.ai/*",
         "https://api-euc1.plaud.ai/*",
@@ -58,12 +72,11 @@ export default defineManifest({
     // HTTP (e.g. http://192.168.1.107:3000) to drive a local Ollama. We grant
     // those origins on demand via the popup, so both schemes are allowed here.
     optional_host_permissions: ["https://*/*", "http://*/*"],
+    // No content script runs on web.plaud.ai anymore -- token capture reads
+    // the pld_ut cookie directly from the background service worker via
+    // chrome.cookies (see background.ts), which is the only thing that can
+    // read an HttpOnly cookie's value at all.
     content_scripts: [
-        {
-            matches: ["https://web.plaud.ai/*"],
-            js: ["src/content-plaud.ts"],
-            run_at: "document_idle",
-        },
         {
             matches: ["https://riffado.com/*"],
             js: ["src/content-bridge.ts"],
